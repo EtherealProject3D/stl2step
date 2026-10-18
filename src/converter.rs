@@ -136,7 +136,10 @@ pub struct Mesh {
     pub verts: Vec<V3>,
     pub faces: Vec<[usize; 3]>,
     pub closed: bool,
+    /// true if any edge is shared by 3+ triangles
     pub nonmanifold: bool,
+    pub open_edges: usize,
+    pub nm_edges: usize,
     pub diag: f64,
     pub warnings: Vec<String>,
 }
@@ -149,6 +152,60 @@ fn canon(a: usize, b: usize, c: usize) -> [usize; 3] {
     } else {
         [c, a, b]
     }
+}
+
+#[inline]
+fn ukey(u: usize, v: usize) -> (usize, usize) {
+    if u < v {
+        (u, v)
+    } else {
+        (v, u)
+    }
+}
+
+/// Flip triangles so that neighbouring triangles (across clean 2-triangle
+/// edges) agree on winding. Returns the number of triangles flipped.
+fn orient_consistent(faces: &mut [[usize; 3]]) -> usize {
+    let n = faces.len();
+    let mut emap: HashMap<(usize, usize), Vec<usize>> = HashMap::with_capacity(n * 2);
+    for (t, f) in faces.iter().enumerate() {
+        for (u, v) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+            emap.entry(ukey(u, v)).or_default().push(t);
+        }
+    }
+    let mut seen = vec![false; n];
+    let mut flips = 0usize;
+    for s in 0..n {
+        if seen[s] {
+            continue;
+        }
+        seen[s] = true;
+        let mut stack = vec![s];
+        while let Some(t) = stack.pop() {
+            let f = faces[t];
+            for (u, v) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+                let lst = &emap[&ukey(u, v)];
+                if lst.len() != 2 {
+                    continue;
+                }
+                let nb = if lst[0] == t { lst[1] } else { lst[0] };
+                if seen[nb] {
+                    continue;
+                }
+                seen[nb] = true;
+                let g = faces[nb];
+                let has_uv = (g[0] == u && g[1] == v)
+                    || (g[1] == u && g[2] == v)
+                    || (g[2] == u && g[0] == v);
+                if has_uv {
+                    faces[nb] = [g[0], g[2], g[1]];
+                    flips += 1;
+                }
+                stack.push(nb);
+            }
+        }
+    }
+    flips
 }
 
 pub fn build_mesh(tris: &[[V3; 3]], weld_rel: f64, scale: f64) -> Result<Mesh, String> {
@@ -173,9 +230,8 @@ pub fn build_mesh(tris: &[[V3; 3]], weld_rel: f64, scale: f64) -> Result<Mesh, S
 
     let mut verts: Vec<V3> = Vec::new();
     let mut vid: HashMap<(i64, i64, i64), usize> = HashMap::new();
-    let mut seen: HashSet<[usize; 3]> = HashSet::new();
-    let mut faces: Vec<[usize; 3]> = Vec::with_capacity(tris.len());
-    let (mut degenerate, mut dup) = (0usize, 0usize);
+    let mut raw: Vec<[usize; 3]> = Vec::with_capacity(tris.len());
+    let mut degenerate = 0usize;
     let min_cross2 = 4.0 * (1e-12 * diag * diag) * (1e-12 * diag * diag);
 
     for t in tris {
@@ -203,32 +259,82 @@ pub fn build_mesh(tris: &[[V3; 3]], weld_rel: f64, scale: f64) -> Result<Mesh, S
             degenerate += 1;
             continue;
         }
-        if !seen.insert(canon(a, b, c)) {
-            dup += 1;
-            continue;
+        raw.push([a, b, c]);
+    }
+
+    // Duplicates: same-orientation copies collapse to one; back-to-back pairs
+    // (same vertices, opposite winding = internal double wall) cancel out.
+    let mut gidx: HashMap<[usize; 3], usize> = HashMap::new();
+    let mut groups: Vec<(usize, usize, [usize; 3])> = Vec::new();
+    for f in &raw {
+        let mut key = *f;
+        key.sort_unstable();
+        let rot = canon(f[0], f[1], f[2]);
+        match gidx.get(&key) {
+            None => {
+                gidx.insert(key, groups.len());
+                groups.push((1, 0, rot));
+            }
+            Some(&gi) => {
+                if groups[gi].2 == rot {
+                    groups[gi].0 += 1;
+                } else {
+                    groups[gi].1 += 1;
+                }
+            }
         }
-        faces.push([a, b, c]);
+    }
+    drop(raw);
+    let mut faces: Vec<[usize; 3]> = Vec::with_capacity(groups.len());
+    let mut removed = 0usize;
+    for &(npos, nneg, rf) in &groups {
+        let cancel = npos.min(nneg);
+        let p = npos - cancel;
+        let q = nneg - cancel;
+        let keep = if p > 0 || q > 0 { 1 } else { 0 };
+        removed += npos + nneg - keep;
+        if p > 0 {
+            faces.push(rf);
+        } else if q > 0 {
+            faces.push([rf[0], rf[2], rf[1]]);
+        }
     }
 
     let mut warnings = Vec::new();
     if degenerate > 0 {
         warnings.push(format!("Removed {degenerate} degenerate triangle(s)."));
     }
-    if dup > 0 {
-        warnings.push(format!("Removed {dup} duplicate triangle(s)."));
+    if removed > 0 {
+        warnings.push(format!(
+            "Removed {removed} duplicate / back-to-back triangle(s)."
+        ));
     }
     if faces.is_empty() {
         return Err("No valid triangles left after cleanup.".into());
     }
 
+    let flips = orient_consistent(&mut faces);
+    if flips > 0 {
+        warnings.push(format!("Fixed inconsistent winding on {flips} triangle(s)."));
+    }
+
+    // topology
+    let mut ucount: HashMap<(usize, usize), u32> = HashMap::new();
     let mut dcount: HashMap<(usize, usize), u32> = HashMap::new();
     for f in &faces {
         for (a, b) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+            *ucount.entry(ukey(a, b)).or_insert(0) += 1;
             *dcount.entry((a, b)).or_insert(0) += 1;
         }
     }
-    let nonmanifold = dcount.values().any(|&v| v > 1);
-    let closed = !nonmanifold && dcount.keys().all(|&(a, b)| dcount.contains_key(&(b, a)));
+    let open_edges = ucount.values().filter(|&&c| c == 1).count();
+    let nm_edges = ucount.values().filter(|&&c| c > 2).count();
+    let nonmanifold = nm_edges > 0;
+    let closed = open_edges == 0
+        && nm_edges == 0
+        && dcount
+            .iter()
+            .all(|(&(a, b), &c)| c == 1 && dcount.contains_key(&(b, a)));
 
     if closed {
         let mut vol = 0.0;
@@ -239,18 +345,14 @@ pub fn build_mesh(tris: &[[V3; 3]], weld_rel: f64, scale: f64) -> Result<Mesh, S
             for f in faces.iter_mut() {
                 f.swap(1, 2);
             }
-            warnings.push("Triangle winding was inverted; flipped it.".into());
+            warnings.push("Mesh was inside-out; flipped it.".into());
         }
-    } else if nonmanifold {
-        warnings.push(
-            "Mesh has non-manifold edges. Output will be a surface model, not a solid.".into(),
-        );
     } else {
-        warnings.push(
-            "Mesh is not watertight (open edges). Output will be a surface model, not a solid. \
-             Repair holes in the STL if you need a solid."
-                .into(),
-        );
+        warnings.push(format!(
+            "Mesh is not a clean closed solid ({open_edges} open edge(s), {nm_edges} \
+             non-manifold edge(s)). Output will be a surface model; in SolidWorks use \
+             Knit Surface with 'Try to form solid'. Fixing the STL first gives a true solid."
+        ));
     }
 
     Ok(Mesh {
@@ -258,6 +360,8 @@ pub fn build_mesh(tris: &[[V3; 3]], weld_rel: f64, scale: f64) -> Result<Mesh, S
         faces,
         closed,
         nonmanifold,
+        open_edges,
+        nm_edges,
         diag,
         warnings,
     })
@@ -298,11 +402,20 @@ pub fn merge_planar(m: &Mesh, ang_tol_deg: f64, dist_rel: f64) -> (Vec<FaceGeo>,
     let cos_tol = ang_tol_deg.to_radians().cos();
     let dist_tol = dist_rel * m.diag;
 
+    let mut ucount: HashMap<(usize, usize), u32> = HashMap::with_capacity(n * 2);
+    for f in faces.iter() {
+        for (u, v) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+            *ucount.entry(ukey(u, v)).or_insert(0) += 1;
+        }
+    }
+    // Only cross clean edges shared by exactly two triangles.
     let mut emap: HashMap<(usize, usize), usize> = HashMap::with_capacity(n * 3);
     for (t, f) in faces.iter().enumerate() {
-        emap.insert((f[0], f[1]), t);
-        emap.insert((f[1], f[2]), t);
-        emap.insert((f[2], f[0]), t);
+        for (u, v) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+            if ucount[&ukey(u, v)] == 2 {
+                emap.insert((u, v), t);
+            }
+        }
     }
 
     let mut visited = vec![false; n];
@@ -386,6 +499,9 @@ fn region_loops(
         dset.insert((f[0], f[1]));
         dset.insert((f[1], f[2]));
         dset.insert((f[2], f[0]));
+    }
+    if dset.len() != region.len() * 3 {
+        return None; // overlapping triangles; fall back
     }
     let mut nxt: HashMap<usize, Vec<usize>> = HashMap::new();
     for &(a, b) in &dset {
@@ -754,7 +870,7 @@ pub fn convert(
         log(format!("  ! {w}"));
     }
 
-    let geo = if opts.merge && !m.nonmanifold {
+    let geo = if opts.merge {
         log("Merging coplanar triangles ...".into());
         let (g, merged) = merge_planar(&m, opts.angle_tol, 1e-4);
         log(format!(
@@ -765,11 +881,16 @@ pub fn convert(
         ));
         g
     } else {
-        if opts.merge {
-            log("  ! Skipping merge because of non-manifold edges.".into());
-        }
         single_faces(&m)
     };
+
+    if geo.len() > 20_000 {
+        log(format!(
+            "  ! {} faces is a LOT for SolidWorks and may take very long to open. \
+             Decimate the STL (e.g. in MeshLab) first.",
+            geo.len()
+        ));
+    }
 
     log("Writing STEP ...".into());
     let stem = src
@@ -844,6 +965,43 @@ mod tests {
         assert_eq!(geo.len(), 6);
         assert_eq!(merged, 12);
         assert!(geo.iter().all(|g| g.outer.len() == 4 && g.holes.is_empty()));
+    }
+
+    #[test]
+    fn mixed_winding_is_repaired_and_merges() {
+        let mut t = cube();
+        for i in [0usize, 3, 4, 9] {
+            let x = t[i];
+            t[i] = [x[0], x[2], x[1]];
+        }
+        let m = build_mesh(&t, 1e-5, 1.0).unwrap();
+        assert!(m.closed);
+        let (geo, _) = merge_planar(&m, 0.1, 1e-4);
+        assert_eq!(geo.len(), 6);
+    }
+
+    #[test]
+    fn back_to_back_pair_and_duplicate_are_removed() {
+        let mut t = cube();
+        let dup = t[1];
+        t.push(dup); // same-orientation duplicate
+        let a = [[0., 0., 0.], [1., 1., 0.], [1., 1., 1.]];
+        t.push(a);
+        t.push([a[0], a[2], a[1]]); // internal double wall
+        let m = build_mesh(&t, 1e-5, 1.0).unwrap();
+        assert_eq!(m.faces.len(), 12);
+        assert!(m.closed);
+    }
+
+    #[test]
+    fn fin_creates_nonmanifold_edge_but_cube_still_merges() {
+        let mut t = cube();
+        t.push([[0., 0., 0.], [1., 0., 0.], [0.5, -1., 0.5]]);
+        let m = build_mesh(&t, 1e-5, 1.0).unwrap();
+        assert!(!m.closed);
+        assert_eq!(m.nm_edges, 1);
+        let (geo, _) = merge_planar(&m, 0.1, 1e-4);
+        assert_eq!(geo.len(), 7);
     }
 
     #[test]
