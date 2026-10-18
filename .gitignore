@@ -1,0 +1,7 @@
+/target
+__pycache__/
+*.pyc
+# test outputs
+*.step
+*.stp
+# NOTE: Cargo.lock is intentionally NOT ignored (this is an application)

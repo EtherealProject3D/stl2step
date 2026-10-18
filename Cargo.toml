@@ -1,0 +1,20 @@
+[package]
+name = "stl2step"
+version = "1.0.0"
+edition = "2021"
+description = "Convert STL meshes into STEP (AP214) B-rep solids"
+license = "MIT"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd"]
+
+[dependencies]
+eframe = { version = "0.29", optional = true }
+rfd = { version = "0.15", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
